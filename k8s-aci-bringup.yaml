@@ -4,9 +4,9 @@
   tasks:
     - name: Deploy the VMs and wait for connection
       vmware_guest:
-        hostname: 10.138.157.3
-        username: administrator@vsphere.local
-        password: C1sc0123!
+        hostname: "{{ vCenterIP }}"
+        username: "{{ vCenterUserName }}"
+        password: "{{ vCenterPassword }}"
         validate_certs: False
         name: "{{ item.split('.')[0] }}"
         template: ubuntu-bionic-k8s-template
