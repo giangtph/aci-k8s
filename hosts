@@ -1,0 +1,24 @@
+[k8s_etcds]
+k8s-etcd01.ciscospdc.local ansible_user=ubuntu     node_ip=10.40.0.11
+k8s-etcd02.ciscospdc.local ansible_user=ubuntu     node_ip=10.40.0.12
+k8s-etcd03.ciscospdc.local ansible_user=ubuntu     node_ip=10.40.0.13
+
+[k8s_masters]
+k8s-master01.ciscospdc.local ansible_user=ubuntu   node_ip=10.40.0.14
+k8s-master02.ciscospdc.local ansible_user=ubuntu   node_ip=10.40.0.15
+k8s-master03.ciscospdc.local ansible_user=ubuntu   node_ip=10.40.0.16
+                                                   
+[k8s_workers]
+k8s-worker01.ciscospdc.local ansible_user=ubuntu   node_ip=10.40.0.21
+k8s-worker02.ciscospdc.local ansible_user=ubuntu   node_ip=10.40.0.22
+k8s-worker03.ciscospdc.local ansible_user=ubuntu   node_ip=10.40.0.23
+
+[k8s_nodes:children]
+k8s_etcds
+k8s_masters
+k8s_workers
+
+[lb_nodes]
+k8s-etcd01.ciscospdc.local lb_vip=10.40.0.10
+k8s-etcd02.ciscospdc.local lb_vip=10.40.0.10
+

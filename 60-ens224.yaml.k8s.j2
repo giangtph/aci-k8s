@@ -1,0 +1,32 @@
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ens224:
+      match:
+        macaddress: {{ ansible_facts['ens224']['macaddress'] }}
+      set-name: ens224
+      mtu: 9000
+
+  vlans:
+    ens224.300:
+      id: 300
+      link: ens224
+      mtu: 9000
+      dhcp4: true
+      routes:
+        - to: 224.0.0.0/4
+          scope: link
+
+    ens224.400:
+      id: 400
+      link: ens224
+      mtu: 9000
+      addresses: [ "{{ node_ip }}/16" ]
+      nameservers:
+        addresses: [ "172.16.9.2" ]
+        search: [ ciscospdc.local ]
+      routes:
+        - to: 0.0.0.0/0
+          via: 10.40.0.1
+          metric: 10

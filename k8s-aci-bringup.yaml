@@ -1,0 +1,436 @@
+---
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Deploy the VMs and wait for connection
+      vmware_guest:
+        hostname: 10.138.157.3
+        username: administrator@vsphere.local
+        password: C1sc0123!
+        validate_certs: False
+        name: "{{ item.split('.')[0] }}"
+        template: ubuntu-bionic-k8s-template
+        customization_spec: ubuntu-customization
+        datacenter: HXDC
+        datastore: datastore-1
+        folder: /
+        networks:
+          - name: 'VLAN369-PXE'
+            start_connected: true
+          - name: 'gp_k8s'
+            start_connected: true
+        state: poweredon
+        wait_for_ip_address: no
+      with_items: "{{ groups['k8s_nodes'] }}"
+
+- hosts: k8s_nodes
+  gather_facts: false
+  tasks: 
+    - name: Wait 600 seconds for the nodes to be reachable
+      wait_for_connection:
+    - name: Setting persistent hostname so it persists after reboot
+      become: yes
+      lineinfile:
+        path: /etc/cloud/cloud.cfg
+        regexp: '^preserve_hostname:'
+        line: "preserve_hostname: true"
+    - name: Disable CloudInit networking so network is not reconfigured after reboot
+      become: yes
+      template:
+        src: 99-disable-network-config.cfg.j2
+        dest: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        owner: root
+        group: root
+        mode: '0600'
+        backup: yes
+
+- hosts: k8s_etcds
+  gather_facts: false
+  tasks:
+    - name: Gathering facts
+      setup:
+    - name: Setup network config on ens224, etcd nodes does not need Infra VLAN subint
+      become: yes
+      template:
+        src: 60-ens224.yaml.etcd.j2
+        dest: /etc/netplan/60-ens224.yaml
+        owner: root
+        group: root
+        mode: '0600'
+        backup: yes
+    - name: Activate networking on ens224
+      become: yes
+      raw: netplan apply
+
+- hosts: k8s_masters, k8s_workers
+  gather_facts: false
+  tasks:
+    - name: Gathering facts
+      setup:
+    - name: Copy DHCP template for the etcd nodes to get IP address through DHCP in ACI Infra VLAN
+      become: yes
+      template:
+        src: dhclient.conf.k8s.j2
+        dest: /etc/dhcp/dhclient.conf
+        owner: root
+        group: root
+        mode: '0600'
+        backup: yes
+    - name: Setup network config on ens224 to provision Infra VLAN and Node VLAN interfaces
+      become: yes
+      template:
+        src: 60-ens224.yaml.k8s.j2
+        dest: /etc/netplan/60-ens224.yaml
+        owner: root
+        group: root
+        mode: '0600'
+        backup: yes
+    - name: Activate networking on ens224
+      become: yes
+      raw: netplan apply
+
+- hosts: lb_nodes
+  gather_facts: false
+  tasks:
+    - name: Install haproxy and heartbeat
+      become: yes
+      apt:
+        name: [haproxy, heartbeat]
+    - name: Setting up haproxy configuration
+      become: yes
+      template:
+        src: haproxy.cfg.j2
+        dest: /etc/haproxy/haproxy.cfg
+        owner: root
+        group: root
+        mode: '0600'
+        backup: yes
+    - name: Setting VIP
+      become: yes
+      lineinfile:
+        path: /etc/sysctl.conf
+        line: net.ipv4.ip_nonlocal_bind=1
+        state: present
+    - name: Enable HA VIP service and start service
+      become: yes
+      shell: |
+        sysctl -p
+        service haproxy restart
+    - name: Create heartbeat auth file
+      become: yes
+      copy:
+        dest: /etc/ha.d/authkeys
+        owner: root          
+        group: root
+        mode: "0600"
+        content: |
+          auth 1
+          1 md5 bb77d0d3b3f239fa5db73bdf27b8d29a
+   
+    - name: Create heartbeat config file  
+      become: yes                         
+      template:                           
+        src: ha.cf.j2                     
+        dest: /etc/ha.d/ha.cf             
+    - name: Create heartbeat resource file
+      become: yes                         
+      copy:                               
+        dest: /etc/ha.d/haresources       
+        content: |                        
+          k8s-etcd01 {{ lb_vip }}         
+                                                
+
+- hosts: k8s-etcd01.ciscospdc.local
+  gather_facts: false
+  tasks:
+    - name: Settings heartbeat neighbor parameters
+      become: yes
+      lineinfile:
+        path: /etc/ha.d/ha.cf
+        regexp: '^ucast ens224.400'
+        line: ucast ens224.400 {{ hostvars['k8s-etcd02.ciscospdc.local']['node_ip'] }}
+
+- hosts: k8s-etcd02.ciscospdc.local
+  gather_facts: false
+  tasks:
+    - name: Settings heartbeat neighbor parameters
+      become: yes
+      lineinfile:
+        path: /etc/ha.d/ha.cf
+        regexp: '^ucast ens224.400'
+        line: ucast ens224.400 {{ hostvars['k8s-etcd01.ciscospdc.local']['node_ip'] }}
+
+- hosts: lb_nodes
+  gather_facts: false
+  tasks:
+    - name: Restart heartbeat service
+      become: yes
+      service:
+        name: heartbeat
+        state: restarted
+
+- hosts: k8s_nodes
+  gather_facts: false
+  tasks:
+    - name: Config Docker daemon to use systemd
+      become: yes
+      copy:
+        content: |
+          {                                              
+          "exec-opts": ["native.cgroupdriver=systemd"],
+          "log-driver": "json-file",                   
+          "log-opts": {                                
+            "max-size": "100m"                         
+          },                                           
+          "storage-driver": "overlay2"                 
+          }     
+        dest: /etc/docker/daemon.json
+        owner: root
+    - name: Set systemd as container runtime           
+      become: yes                                      
+      shell: |                                                                               
+        mkdir -p /etc/systemd/system/docker.service.d  
+        systemctl daemon-reload                        
+        systemctl restart docker                       
+        systemctl enable docker                        
+
+- hosts: k8s-etcd01.ciscospdc.local
+  gather_facts: false
+  tasks:
+    - name: Copy init cert script to etcd01
+      become: yes
+      template:
+        src: etcd-init-certs.sh.j2
+        dest: /tmp/etcd-init-certs.sh
+        mode: '0600'
+        owner: root
+    - name: Run init cert script on etcd01
+      become: yes
+      shell: 
+        chdir: /tmp/
+        cmd: bash etcd-init-certs.sh && cp -Rf /tmp/{{ node_ip }}/kubeadmcfg.yaml /root/
+    - name: Fetch the created certs and manifests for etcd01
+      become: yes                                           
+      synchronize:                                                
+        src: "{{ item }}"                
+        dest: /tmp/{{ node_ip }}/
+        mode: pull
+      with_items:
+        - "/etc/kubernetes/pki/apiserver-etcd-client.crt"
+        - "/etc/kubernetes/pki/apiserver-etcd-client.key"                    
+        - "/etc/kubernetes/pki/etcd/ca.crt"
+    - name: Fetch the created certs and manifests for etcd02
+      become: yes
+      synchronize:
+        mode: pull
+        src: /tmp/{{ hostvars['k8s-etcd02.ciscospdc.local']['node_ip'] }}
+        dest: /tmp
+    - name: Fetch the created certs and manifests for etcd03             
+      become: yes                                                        
+      synchronize:                                                       
+        mode: pull                                                       
+        src: /tmp/{{ hostvars['k8s-etcd03.ciscospdc.local']['node_ip'] }}
+        dest: /tmp
+
+- hosts: k8s-etcd02.ciscospdc.local
+  gather_facts: false
+  tasks:
+    - name: Copy the certs and config file from local machine
+      become: yes
+      synchronize:
+        src: /tmp/{{ hostvars['k8s-etcd02.ciscospdc.local']['node_ip'] }}/
+        dest: /root
+    - name: Copy the keys to the kubernetes folder
+      become: yes
+      shell: |
+        cd /root
+        cp -Rf pki /etc/kubernetes/
+
+- hosts: k8s-etcd03.ciscospdc.local                                      
+  gather_facts: false                                                    
+  tasks:                                                                 
+    - name: Copy the certs and config file from local machine            
+      become: yes                                                        
+      synchronize:                                                       
+        src: /tmp/{{ hostvars['k8s-etcd03.ciscospdc.local']['node_ip'] }}/
+        dest: /root                                                      
+    - name: Copy the keys to the kubernetes folder                       
+      become: yes                                                        
+      shell: |                                                           
+        cd /root                                                         
+        cp -Rf pki /etc/kubernetes/                                        
+
+- hosts: k8s_etcds
+  gather_facts: false
+  tasks:
+    - name: Config etcd service manager
+      become: yes
+      copy:
+        content: |
+          [Service]
+          ExecStart=
+          ExecStart=/usr/bin/kubelet --address=127.0.0.1 --pod-manifest-path=/etc/kubernetes/manifests --cgroup-driver=systemd
+          Restart=always
+        dest: /etc/systemd/system/kubelet.service.d/20-etcd-service-manager.conf
+        owner: root
+ 
+    - name: Init etcd on etcd nodes
+      become: yes
+      shell: |
+        systemctl daemon-reload
+        systemctl restart docker 
+        kubeadm init phase etcd local --config=/root/kubeadmcfg.yaml
+        systemctl restart kubelet
+        
+    - name: Wait till health check is available
+      uri: 
+        url: http://127.0.0.1:2381/health
+        method: GET
+      register: result
+      until: result.status == 200
+      retries: 720
+      delay: 10
+
+    - name: Wait till health check is successful
+      uri: 
+        url: http://127.0.0.1:2381/health
+        method: GET
+        return_content: yes
+        status_code: 200
+        body_format: json
+      register: health
+      until: health.json.health == "true"
+      retries: 720
+      delay: 10
+
+- hosts: k8s-master01.ciscospdc.local
+  gather_facts: false
+  tasks:
+    - name: Copy certs to first master node
+      become: yes 
+      synchronize:
+        src: /tmp/{{ hostvars['k8s-etcd01.ciscospdc.local']['node_ip'] }}/
+        dest: /root
+    - name: Copy kubeadm config file to first master node
+      become: yes
+      template:
+        src: kubeadminit.yaml.j2
+        dest: /etc/kubernetes/kubeadminit.yaml
+        owner: root
+        group: root
+        mode: '0600'
+        backup: yes
+    - name: Copy certs to kubernetes directory
+      become: yes
+      shell: |
+        mkdir -p /etc/kubernetes/pki/etcd/ 
+        cp /root/ca.crt /etc/kubernetes/pki/etcd/
+        cp /root/apiserver-etcd-client.crt /etc/kubernetes/pki/
+        cp /root/apiserver-etcd-client.key /etc/kubernetes/pki/
+    - name: Init the control plane on master node using kubeadm init
+      become: yes
+      shell: |
+        cd /root
+        kubeadm init --config /etc/kubernetes/kubeadminit.yaml
+      register: init_output
+    - local_action:
+        module: copy
+        content: |
+          {{ init_output.stdout_lines[-2] }}
+          {{ init_output.stdout_lines[-1] }} --control-plane
+        dest: "./join-master"
+    - local_action:
+        module: copy
+        content: |
+          {{ init_output.stdout_lines[-2] }}
+          {{ init_output.stdout_lines[-1] }}
+        dest: "./join-worker"
+    - name: Create kubectl config
+      shell: |
+        mkdir -p $HOME/.kube
+        sudo cp -Rf /etc/kubernetes/admin.conf $HOME/.kube/config
+        sudo chown $(id -u):$(id -g) $HOME/.kube/config
+    - name: Copy ACI CNI config
+      copy: 
+        src: /home/administrator/aci-k8s/aci-k8s-containers.yaml
+        dest: /home/ubuntu
+    - name: Apply ACI CNI config
+      command: kubectl apply -f aci-k8s-containers.yaml
+    - name: Wait for master node to be ready
+      shell: >
+        kubectl get node k8s-master01
+      register: result
+      until: result.stdout.find("Ready") != -1
+      retries: 100
+      delay: 10
+    - name: fetch the k8s certs and keys from the first master node
+      become: yes
+      synchronize:
+        mode: pull
+        src: "{{ item }}"
+        dest: /tmp/{{ node_ip }}/
+      with_items:
+        - /etc/kubernetes/pki/ca.crt
+        - /etc/kubernetes/pki/ca.key
+        - /etc/kubernetes/pki/sa.key
+        - /etc/kubernetes/pki/sa.pub
+        - /etc/kubernetes/pki/front-proxy-ca.crt
+        - /etc/kubernetes/pki/front-proxy-ca.key
+        - /etc/kubernetes/pki/apiserver-etcd-client.crt
+        - /etc/kubernetes/pki/apiserver-etcd-client.key
+        - /etc/kubernetes/admin.conf
+    - name: fetch the etcd ca
+      synchronize:
+        mode: pull
+        src: /etc/kubernetes/pki/etcd/ca.crt
+        dest: /tmp/{{ node_ip }}/etcd-ca.crt
+- hosts: k8s-master02.ciscospdc.local, k8s-master03.ciscospdc.local
+  gather_facts: false
+  tasks:
+    - name: Copy join command to the remaining master nodes
+      become: yes
+      copy:
+        src: ./join-master
+        dest: /root/
+    - name: Copy the k8s and etcd certs and keys to the remaining master nodes
+      become: yes
+      synchronize:
+        src: /tmp/{{ hostvars['k8s-master01.ciscospdc.local']['node_ip'] }}/
+        dest: /root 
+    - name: Copy the certs to the kubernetes directory
+      become: yes
+      shell: |
+        mkdir -p /etc/kubernetes/pki/etcd
+        cp -Rf /root/ca.crt /etc/kubernetes/pki/
+        cp -Rf /root/ca.key /etc/kubernetes/pki/
+        cp -Rf /root/sa.pub /etc/kubernetes/pki/
+        cp -Rf /root/sa.key /etc/kubernetes/pki/
+        cp -Rf /root/apiserver-etcd-client.crt /etc/kubernetes/pki/ 
+        cp -Rf /root/apiserver-etcd-client.key /etc/kubernetes/pki/
+        cp -Rf /root/front-proxy-ca.crt /etc/kubernetes/pki/
+        cp -Rf /root/front-proxy-ca.key /etc/kubernetes/pki/
+        cp -Rf /root/etcd-ca.crt /etc/kubernetes/pki/etcd/ca.crt
+        cp -Rf /root/admin.conf /etc/kubernetes/admin.conf
+    - name: Join the masters to the cluster
+      become: yes
+      shell: |
+        cd /root
+        sh join-master
+    - name: Create kubectl config
+      shell: |
+        mkdir -p $HOME/.kube
+        sudo cp -Rf /etc/kubernetes/admin.conf $HOME/.kube/config
+        sudo chown $(id -u):$(id -g) $HOME/.kube/config
+- hosts: k8s_workers
+  gather_facts: false
+  tasks:
+    - name: Copy join command to the workers
+      become: yes
+      copy:
+        src: ./join-worker
+        dest: /root/
+    - name: Join the workers to the cluster
+      become: yes
+      shell: |
+        cd /root
+        sh join-worker

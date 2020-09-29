@@ -1,0 +1,22 @@
+global
+    user haproxy
+    group haproxy
+defaults
+    mode http
+    log global
+    retries 2
+    timeout connect 3000ms
+    timeout server 5000ms
+    timeout client 5000ms
+frontend kubernetes
+    bind {{ lb_vip }}:6443
+    option tcplog
+    mode tcp
+    default_backend kubernetes-master-nodes
+backend kubernetes-master-nodes
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    server k8s-master01 {{ hostvars['k8s-master01.ciscospdc.local']['node_ip'] }}:6443 check fall 3 rise 2
+    server k8s-master02 {{ hostvars['k8s-master02.ciscospdc.local']['node_ip'] }}:6443 check fall 3 rise 2
+    server k8s-master03 {{ hostvars['k8s-master03.ciscospdc.local']['node_ip'] }}:6443 check fall 3 rise 2
